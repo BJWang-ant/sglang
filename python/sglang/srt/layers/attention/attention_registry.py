@@ -240,3 +240,12 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("sage-attention")
+def create_sage_attention_backend(runner):
+    from sglang.srt.layers.attention.sage_attention_backend import (
+        SageAttentionBackend,
+    )
+
+    return SageAttentionBackend(runner)

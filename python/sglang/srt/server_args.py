@@ -131,6 +131,7 @@ ATTENTION_BACKEND_CHOICES = [
     "fa4",
     "flashinfer",
     "flashmla",
+    "sage-attention",
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
