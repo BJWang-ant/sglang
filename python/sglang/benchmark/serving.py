@@ -128,6 +128,15 @@ class RequestFuncOutput:
         return output
 
 
+def flush_server_cache(base_url: str, backend: str) -> None:
+    """Flush an engine's prefix cache after benchmark warmup."""
+    cache_endpoint = (
+        "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
+    )
+    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    response.raise_for_status()
+
+
 def get_auth_headers() -> Dict[str, str]:
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     if openai_api_key:
@@ -249,7 +258,7 @@ async def async_request_trt_llm(
 
 
 def _extract_cache_from_sglext(data, output):
-    """Extract cache hit details from sglext in OAI-compatible responses."""
+    """Read cache details from sglext or the cached token count from usage."""
     sglext = data.get("sglext") or {}
     details = sglext.get("cached_tokens_details")
     if details:
@@ -259,6 +268,12 @@ def _extract_cache_from_sglext(data, output):
             + (details.get("storage") or 0)
         )
         output.cached_tokens_details = details
+    elif output.cached_tokens_details is None:
+        usage = data.get("usage") or {}
+        prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+        cached_tokens = prompt_tokens_details.get("cached_tokens")
+        if cached_tokens is not None:
+            output.cached_tokens = cached_tokens
 
 
 def _record_server_prompt_len(data, output):
@@ -1133,6 +1148,24 @@ async def get_request(
             await asyncio.sleep(interval)
 
 
+def _get_metric_itls(
+    output: RequestFuncOutput,
+    tokenizer: PreTrainedTokenizerBase,
+    use_retokenized_itl: bool,
+) -> List[float]:
+    if not use_retokenized_itl:
+        return output.itl
+
+    metric_itls = []
+    for k, itl in enumerate(output.itl):
+        num_tokens = len(
+            tokenizer.encode(output.text_chunks[k], add_special_tokens=False)
+        )
+        adjusted_itl = itl / num_tokens
+        metric_itls.extend([adjusted_itl] * num_tokens)
+    return metric_itls
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -1174,17 +1207,11 @@ def calculate_metrics(
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+            metric_itls = _get_metric_itls(outputs[i], tokenizer, use_retokenized_itl)
             if use_retokenized_itl:
-                for k, itl in enumerate(outputs[i].itl):
-                    num_tokens = len(
-                        tokenizer.encode(
-                            outputs[i].text_chunks[k], add_special_tokens=False
-                        )
-                    )
-                    adjusted_itl = itl / num_tokens
-                    retokenized_itls.extend([adjusted_itl] * num_tokens)
+                retokenized_itls.extend(metric_itls)
             else:
-                itls += outputs[i].itl
+                itls.extend(metric_itls)
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -1312,6 +1339,69 @@ def calculate_metrics(
     )
 
     return metrics, output_lens
+
+
+def _shard_input_requests(input_requests: List[Any]) -> List[Any]:
+    shard_count_raw = os.getenv("SGLANG_BENCH_NUM_SHARDS")
+    shard_index_raw = os.getenv("SGLANG_BENCH_SHARD_INDEX")
+    if shard_count_raw is None and shard_index_raw is None:
+        return input_requests
+    if shard_count_raw is None or shard_index_raw is None:
+        raise ValueError(
+            "SGLANG_BENCH_NUM_SHARDS and SGLANG_BENCH_SHARD_INDEX must be set together"
+        )
+
+    shard_count = int(shard_count_raw)
+    shard_index = int(shard_index_raw)
+    expected_count_raw = os.getenv("SGLANG_BENCH_EXPECTED_NUM_REQUESTS")
+    if expected_count_raw is not None and len(input_requests) != int(
+        expected_count_raw
+    ):
+        raise ValueError(
+            "Loaded benchmark dataset size does not match the launcher request: "
+            f"expected {expected_count_raw}, got {len(input_requests)}"
+        )
+    if shard_count <= 0 or not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"Invalid benchmark shard: index={shard_index}, count={shard_count}"
+        )
+
+    sharded_requests = input_requests[shard_index::shard_count]
+    if not sharded_requests:
+        raise ValueError(
+            f"Benchmark shard {shard_index}/{shard_count} contains no requests"
+        )
+    print(
+        f"Using benchmark request shard {shard_index}/{shard_count}: "
+        f"{len(sharded_requests)} of {len(input_requests)} requests"
+    )
+    return sharded_requests
+
+
+def _wait_for_multiprocess_start_barrier() -> bool:
+    ready_file_raw = os.getenv("SGLANG_BENCH_READY_FILE")
+    start_file_raw = os.getenv("SGLANG_BENCH_START_FILE")
+    if ready_file_raw is None and start_file_raw is None:
+        return False
+    if ready_file_raw is None or start_file_raw is None:
+        raise ValueError(
+            "SGLANG_BENCH_READY_FILE and SGLANG_BENCH_START_FILE must be set together"
+        )
+
+    ready_file = Path(ready_file_raw)
+    start_file = Path(start_file_raw)
+    ready_file.parent.mkdir(parents=True, exist_ok=True)
+    ready_file.write_text(str(os.getpid()))
+
+    timeout_s = float(os.getenv("SGLANG_BENCH_BARRIER_TIMEOUT_SEC", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while not start_file.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for benchmark start barrier {start_file}"
+            )
+        time.sleep(0.01)
+    return True
 
 
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
@@ -1517,13 +1607,12 @@ async def benchmark(
             f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
         )
 
-    # Flush cache after warmup so the measured run does not benefit from
-    # request-local prefix reuse. vLLM exposes a different, development-mode
-    # endpoint for the same purpose.
+    # The multiprocess launcher flushes once after all workers finish warming up.
+    multiprocess = _wait_for_multiprocess_start_barrier()
     should_flush_cache = (
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
-    if should_flush_cache:
+    if should_flush_cache and not multiprocess:
         flush_server_cache(
             base_url,
             backend,
@@ -1531,7 +1620,8 @@ async def benchmark(
             getattr(args, "admin_api_key", None),
         )
 
-    await asyncio.sleep(1.0)
+    if not multiprocess:
+        await asyncio.sleep(1.0)
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
@@ -1626,6 +1716,7 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    benchmark_end_time = time.perf_counter()
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1671,7 +1762,7 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    benchmark_duration = benchmark_end_time - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
@@ -1876,6 +1967,8 @@ async def benchmark(
             "server_info": server_info,
             # Results
             "duration": benchmark_duration,
+            "benchmark_start_time": benchmark_start_time,
+            "benchmark_end_time": benchmark_end_time,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
             "total_input_text_tokens": metrics.total_input_text,
@@ -1951,14 +2044,34 @@ async def benchmark(
                 f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
             )
 
+    use_retokenized_metric_itl = (
+        accept_length is not None
+        and accept_length > 0
+        and backend in ("sglang-oai", "sglang-oai-chat")
+    )
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
+        "successes": [output.success for output in outputs],
+        "latencies": [output.latency for output in outputs],
+        "start_times": [output.start_time for output in outputs],
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if use_retokenized_metric_itl:
+        result_details["metric_itls"] = [
+            (
+                _get_metric_itls(output, tokenizer, use_retokenized_metric_itl)
+                if output.success
+                else []
+            )
+            for output in outputs
+        ]
+    if not _get_bool_env_var("SGLANG_BENCH_OMIT_GENERATED_TEXT"):
+        result_details["generated_texts"] = [
+            output.generated_text for output in outputs
+        ]
 
     if args.cache_report:
         result_details["cached_tokens"] = [o.cached_tokens for o in outputs]
@@ -2190,6 +2303,12 @@ def run_benchmark(args_: argparse.Namespace):
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
     input_requests = get_dataset(args, tokenizer, model_id)
+    input_requests = _shard_input_requests(input_requests)
+
+    request_seed = os.getenv("SGLANG_BENCH_REQUEST_SEED")
+    if request_seed is not None:
+        random.seed(int(request_seed))
+        np.random.seed(int(request_seed))
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):

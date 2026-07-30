@@ -81,13 +81,23 @@ def sample_openai_requests(
         # Extract extra request body parameters (tools, temperature, top_p, etc.)
         extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
 
-        # Calculate prompt length by applying chat template
-        # This includes the messages but not the tools
-        prompt_len = len(
-            tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, return_dict=False
+        if getattr(tokenizer, "chat_template", None):
+            prompt_len = len(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=False,
+                )
             )
-        )
+        else:
+            # The server can render messages with its own chat encoder.
+            # Use an estimate until the server reports usage.prompt_tokens.
+            prompt_len = len(
+                tokenizer.encode(
+                    json.dumps(messages, ensure_ascii=False), add_special_tokens=False
+                )
+            )
 
         # If tools are present, we need to add their token count
         # Tools are sent as part of the request and count toward input tokens

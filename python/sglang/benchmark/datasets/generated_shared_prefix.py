@@ -1,4 +1,5 @@
 import math
+import os
 import pickle
 import random
 import uuid
@@ -19,6 +20,7 @@ from sglang.benchmark.datasets.common import (
     gen_prompt,
     gen_prompt_ids,
 )
+from sglang.srt.environ import envs
 
 
 def _zipf_group_probs(num_groups: int, alpha: float) -> np.ndarray:
@@ -145,7 +147,8 @@ def get_gen_prefix_cache_path(
     on-disk caches remain valid. Non-default sampling modes get an extra
     suffix encoding the parameters that affect the cached payload.
     """
-    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
+    # cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
+    cache_dir = Path(envs.SGLANG_CACHE_DIR.get()).expanduser() / "benchmark"
 
     suffix = ""
     if group_distribution != "uniform":
@@ -226,8 +229,10 @@ def sample_generated_shared_prefix_requests(
         f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=}, {num_turns=}, {group_distribution=}, {zipf_alpha=})"
     )
 
-    run_random_str = uuid.uuid4().hex[:8]
-    run_start_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    run_random_str = os.getenv("SGLANG_BENCH_GSP_RUN_ID") or uuid.uuid4().hex[:8]
+    run_start_timestamp = os.getenv(
+        "SGLANG_BENCH_GSP_RUN_TIMESTAMP"
+    ) or datetime.now().strftime("%Y%m%d%H%M%S")
 
     system_prompt_lens = compute_random_lens(
         full_len=system_prompt_len,
@@ -357,7 +362,14 @@ def sample_generated_shared_prefix_requests(
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Caching generated input data to {cache_path}")
-        with open(cache_path, "wb") as f:
-            pickle.dump(input_requests, f)
+        temp_cache_path = cache_path.with_name(
+            f".{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with open(temp_cache_path, "wb") as f:
+                pickle.dump(input_requests, f)
+            os.replace(temp_cache_path, cache_path)
+        finally:
+            temp_cache_path.unlink(missing_ok=True)
 
     return input_requests
