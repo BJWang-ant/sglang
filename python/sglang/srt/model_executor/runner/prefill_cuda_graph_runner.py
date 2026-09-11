@@ -529,9 +529,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.backend, BreakableCudaGraphBackend
         ) and should_enable_cp_bcg_capture(server_args)
         if self.enable_cp_bcg_capture:
-            if self.max_context_size is not None:
-                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
-                # metadata preparation before enabling the fixed context limit.
+            # DSV4 builds capture/replay metadata from the static batch carrying
+            # max_seq_len_override. CP shards query rows while preserving this
+            # context bound; backends without fixed-context metadata still opt out.
+            if self.max_context_size is not None and not (
+                model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
+            ):
                 self._ignore_max_context_size("CP breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
@@ -766,6 +769,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
                 input_ids = forward_batch.input_ids
+                if self.prefill_cp_bcg_input is not None:
+                    input_ids = self.prefill_cp_bcg_input.model_input_ids.get(
+                        num_tokens, input_ids
+                    )
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
@@ -1277,6 +1284,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
+            return False
+
+        # A tiny batch may not activate CP even when the runner captures CP
+        # graphs. Its unsharded inputs cannot replay a CP-local model body.
+        if self.enable_cp_bcg_capture and not is_cp_active(forward_batch):
             return False
 
         # Non-DP local check (sole decision for tp-only).
@@ -2037,9 +2049,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
             if self.enable_cp_bcg_capture:
-                assert self.max_context_size is None, (
-                    "CP-v2 BCG replay does not support a fixed prefill context size"
-                )
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,

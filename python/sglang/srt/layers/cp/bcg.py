@@ -31,6 +31,8 @@ from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_interleave_input_ids,
+    cp_shard_hidden_states,
     cp_split_before_forward,
     prepare_cp_forward,
 )
@@ -103,6 +105,8 @@ class PrefillCPBCGInput:
     positions: torch.Tensor
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
+    model_input_ids: Dict[int, torch.Tensor] = field(default_factory=dict)
+    moe_input_ids: Dict[int, torch.Tensor] = field(default_factory=dict)
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
@@ -270,12 +274,31 @@ class PrefillCPBCGInput:
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
+            # Mirror eager cp_shard_model_inputs: the model takes local IDs,
+            # while hash MoE takes local IDs with A2A or rank-major gathered IDs
+            # without A2A. Keep the original batch IDs global for metadata/logits.
+            # Build from live lengths before publishing the fixed bucket geometry.
+            local_input_ids = cp_shard_hidden_states(global_input_ids, forward_batch)
+            moe_input_ids = cp_interleave_input_ids(global_input_ids, forward_batch)
+            if capture:
+                self.model_input_ids[static_num_tokens] = torch.empty_like(
+                    local_input_ids
+                )
+                self.moe_input_ids[static_num_tokens] = torch.empty_like(moe_input_ids)
+            # Captured hash-routing kernels retain these addresses. Refresh their
+            # contents on every replay, including zero padding from the CP helpers.
+            self.model_input_ids[static_num_tokens].copy_(local_input_ids)
+            self.moe_input_ids[static_num_tokens].copy_(moe_input_ids)
+            forward_batch.input_ids_global = self.moe_input_ids[static_num_tokens]
+
             # DSV4's layer-internal KV/compressor gathers are captured too. Their
             # global output rows and cache-write buffers must retain the bucket
             # shape even when the live batch is smaller. Shard using the real
             # lengths above, then expose the fixed geometry to the model body.
-            # Sequence/extend lengths stay live for causal and compressor plans;
-            # the registry zeroes the unused cache locations (the dummy slot).
+            # Sequence/extend lengths stay live for causal and compressor plans.
+            # Preserve max_seq_len_override on this static batch: it bounds the
+            # context axis identically for capture and replay, independently of
+            # the query-row padding. The registry zeroes unused cache locations.
             metadata = forward_batch.attn_cp_metadata
             cp_size = len(metadata.per_rank_actual_token)
             base, remainder = divmod(static_num_tokens, cp_size)
