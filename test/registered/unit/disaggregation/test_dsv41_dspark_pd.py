@@ -189,5 +189,98 @@ class TestDSV41DSparkPD(CustomTestCase):
                     self.assertEqual(queue.retracted_queue, [req])
 
 
+class TestDSV41CPPDHandshake(CustomTestCase):
+    def make(self, rank=0, hybrid=True):
+        m = object.__new__(CommonKVManager)
+        m.prefill_info_table = {}
+        m.kv_args = SimpleNamespace(page_size=256, engine_rank=rank)
+        m.kv_cache_dtype_str = "fp8_e4m3"
+        m.dsv41_spec_layout = {"kv_item_lens": [512], "state_item_lens": [[32768]]}
+        m.attn_tp_size = 4
+        m.attn_cp_size = 1
+        m.attn_cp_rank = 0
+        m.dcp_size = 1
+        m.is_mla_backend = False
+        m.is_hybrid_mla_backend = hybrid
+        m.enable_all_cp_ranks_for_transfer = True
+        m.pp_size = 1
+        m.pp_rank = 0
+        return m
+
+    def fetch(self, m, tp, cp, layout=None):
+        response = Mock(status_code=200)
+        response.json.return_value = dict(
+            attn_tp_size=tp,
+            attn_cp_size=cp,
+            dp_size=1,
+            pp_size=1,
+            page_size=256,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+            dsv41_spec_layout=layout or m.dsv41_spec_layout,
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get", return_value=response
+        ):
+            return m.try_ensure_parallel_info("prefill:8761")
+
+    def test_cp4_maps_all_shards_to_each_decode_rank(self):
+        for rank in range(4):
+            m = self.make(rank)
+            self.assertTrue(self.fetch(m, 1, 4))
+            info = m.prefill_info_table["prefill:8761"]
+            self.assertEqual(info.target_tp_ranks, [0])
+            self.assertEqual(info.target_cp_ranks, [0, 1, 2, 3])
+            self.assertEqual(info.required_prefill_response_num, 4)
+            self.assertEqual(info.required_dst_info_num, 4)
+
+    def test_dsv4_pool_is_classified_as_mla(self):
+        from sglang.srt.disaggregation.utils import is_mla_backend
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        self.assertTrue(is_mla_backend(pool))
+        m = self.make(hybrid=False)
+        m.is_mla_backend = is_mla_backend(pool)
+        self.assertTrue(self.fetch(m, 1, 4))
+        self.assertEqual(
+            m.prefill_info_table["prefill:8761"].required_prefill_response_num, 4
+        )
+
+    def test_cp2_tp2_maps_corresponding_tp_and_both_cp_ranks(self):
+        for rank in range(4):
+            m = self.make(rank)
+            self.assertTrue(self.fetch(m, 2, 2))
+            info = m.prefill_info_table["prefill:8761"]
+            self.assertEqual(info.target_tp_ranks, [rank // 2])
+            self.assertEqual(info.target_cp_ranks, [0, 1])
+            self.assertEqual(info.required_prefill_response_num, 2)
+
+    def test_plain_tp4_unchanged(self):
+        m = self.make(3)
+        self.assertTrue(self.fetch(m, 4, 1))
+        info = m.prefill_info_table["prefill:8761"]
+        self.assertEqual(info.target_tp_ranks, [3])
+        self.assertEqual(info.target_cp_ranks, [0])
+
+    def test_unequal_model_tp_rejected(self):
+        for tp, cp in [(2, 1), (1, 2), (1, 8)]:
+            m = self.make()
+            with self.assertRaisesRegex(RuntimeError, "same TP size"):
+                self.fetch(m, tp, cp)
+            self.assertFalse(m.prefill_info_table)
+
+    def test_nonhybrid_cp_mismatch_rejected(self):
+        m = self.make(hybrid=False)
+        with self.assertRaisesRegex(RuntimeError, "same TP size"):
+            self.fetch(m, 1, 4)
+
+    def test_layout_mismatch_still_rejected(self):
+        m = self.make()
+        with self.assertRaisesRegex(RuntimeError, "layout mismatch"):
+            self.fetch(m, 1, 4, {"kv_item_lens": [1024], "state_item_lens": [[32768]]})
+        self.assertFalse(m.prefill_info_table)
+
+
 if __name__ == "__main__":
     unittest.main()
