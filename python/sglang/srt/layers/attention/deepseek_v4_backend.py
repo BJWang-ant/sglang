@@ -3352,13 +3352,24 @@ class DeepseekV4AttnBackend(
     def _publish_or_consume_candidates(
         self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
     ) -> None:
+        # Use a prefill-only kernel; keep the shared selector for other devices.
+        select_blocks = select_candidate_blocks
+        fused_source = (
+            indexer.is_candidate_source and logits.is_cuda and not torch.version.hip
+        )
+        if fused_source:
+            from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
+                select_prefill_candidate_blocks,
+            )
+
+            select_blocks = select_prefill_candidate_blocks
         publish = [] if indexer.is_candidate_source else None
         consume = (
             None
             if publish is not None
             else published_masks(self.forward_metadata.candidate_metadata)
         )
-        j = torch.arange(logits.shape[1], device=logits.device)
+        j = None if fused_source else torch.arange(logits.shape[1], device=logits.device)
         tok_start = 0
         for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
             rows = slice(tok_start, tok_start + t_len)
@@ -3373,11 +3384,12 @@ class DeepseekV4AttnBackend(
                 continue
             lens = compress_lens[rows, None]
             # the block selection tells unreachable positions apart by -inf
-            scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
+            if not fused_source:
+                scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
             step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
             masks = [
-                select_candidate_blocks(
+                select_blocks(
                     scores[start : start + step],
                     lens[start : start + step],
                     topk_blocks=indexer.candidate_topk_blocks,
