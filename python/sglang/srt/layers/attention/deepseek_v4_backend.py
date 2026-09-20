@@ -59,6 +59,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMasks,
+    PrefillCandidateBlocks,
     CandidateMetadata,
     IndexerInputs,
     make_candidate_indexer,
@@ -1799,7 +1800,11 @@ class DeepseekV4AttnBackend(
         # TODO(candidate): goes away once the source publishes its tail rows straight
         # onto the tail metadata (publish_prefill); until then cut the full masks.
         full_masks = self.forward_metadata.candidate_metadata
-        if isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
+        if isinstance(full_masks, PrefillCandidateBlocks):
+            tail_metadata.candidate_metadata = full_masks.select_rows(
+                tail.token_indices
+            )
+        elif isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
             tail_metadata.candidate_metadata = CandidateMasks(
                 request_masks=[
                     mask[mask.shape[0] - t :]
@@ -3324,17 +3329,32 @@ class DeepseekV4AttnBackend(
             # the fused top-k reads score rows through 16-byte vectors
             ceil_align(max(lc_per_req), 4),
         )
+        candidate_blocks = None
         if indexer.is_candidate_source or indexer.uses_candidates:
-            self._publish_or_consume_candidates(
+            candidate_blocks = self._publish_or_consume_candidates(
                 indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
             )
         topk = indexer.index_topk
         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        topk_transform_ragged_v2(
-            logits, compress_lens, out_offsets=ks, out_indices=selected
-        )
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            selected = mask_topk_scores(logits, selected, ks)
+        if candidate_blocks is not None:
+            from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
+                topk_prefill_candidates,
+            )
+
+            topk_prefill_candidates(
+                logits,
+                compress_lens,
+                candidate_blocks.mask,
+                candidate_blocks.block_size,
+                ks,
+                selected,
+            )
+        else:
+            topk_transform_ragged_v2(
+                logits, compress_lens, out_offsets=ks, out_indices=selected
+            )
+            if indexer.uses_candidates and not indexer.is_candidate_source:
+                selected = mask_topk_scores(logits, selected, ks)
         # ascending positions, padding last: the layout the consumers expect
         unselected = torch.iinfo(torch.int32).max
         selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
@@ -3351,25 +3371,60 @@ class DeepseekV4AttnBackend(
     # into the candidate indexer as publish_prefill / select_prefill.
     def _publish_or_consume_candidates(
         self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-    ) -> None:
-        # Use a prefill-only kernel; keep the shared selector for other devices.
-        select_blocks = select_candidate_blocks
-        fused_source = (
-            indexer.is_candidate_source and logits.is_cuda and not torch.version.hip
-        )
-        if fused_source:
+    ) -> Optional[PrefillCandidateBlocks]:
+        if logits.is_cuda and not torch.version.hip:
+            if not indexer.is_candidate_source:
+                candidates = self.forward_metadata.candidate_metadata
+                assert isinstance(candidates, PrefillCandidateBlocks)
+                assert candidates.block_size == indexer.candidate_block_size
+                assert candidates.mask.shape[0] == logits.shape[0]
+                return candidates
+
             from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
                 select_prefill_candidate_blocks,
             )
 
-            select_blocks = select_prefill_candidate_blocks
+            block = indexer.candidate_block_size
+            width = (logits.shape[1] + block - 1) // block
+            mask = torch.zeros(
+                (logits.shape[0], width), dtype=torch.bool, device=logits.device
+            )
+            start = 0
+            for lc, count in zip(lc_per_req, q_lens_cpu):
+                rows = slice(start, start + count)
+                start += count
+                if lc == 0 or count == 0:
+                    continue
+                # The fused kernel only materializes block scores. Still bound
+                # that temporary for very long contexts and large query batches.
+                blocks = (lc + block - 1) // block
+                step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (blocks * 4))
+                for offset in range(0, count, step):
+                    chunk = slice(
+                        rows.start + offset,
+                        min(rows.stop, rows.start + offset + step),
+                    )
+                    selected = select_prefill_candidate_blocks(
+                        logits[chunk, :lc],
+                        compress_lens[chunk],
+                        indexer.candidate_topk_blocks,
+                        block,
+                        compact=True,
+                    )
+                    mask[chunk, : selected.shape[1]] = selected
+            self.forward_metadata.candidate_metadata = PrefillCandidateBlocks(
+                mask, block
+            )
+            # Source token top-k must remain unrestricted by its published blocks.
+            return None
+
         publish = [] if indexer.is_candidate_source else None
         consume = (
             None
             if publish is not None
             else published_masks(self.forward_metadata.candidate_metadata)
         )
-        j = None if fused_source else torch.arange(logits.shape[1], device=logits.device)
+        j = torch.arange(logits.shape[1], device=logits.device)
         tok_start = 0
         for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
             rows = slice(tok_start, tok_start + t_len)
@@ -3384,12 +3439,11 @@ class DeepseekV4AttnBackend(
                 continue
             lens = compress_lens[rows, None]
             # the block selection tells unreachable positions apart by -inf
-            if not fused_source:
-                scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
+            scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
             step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
             masks = [
-                select_blocks(
+                select_candidate_blocks(
                     scores[start : start + step],
                     lens[start : start + step],
                     topk_blocks=indexer.candidate_topk_blocks,

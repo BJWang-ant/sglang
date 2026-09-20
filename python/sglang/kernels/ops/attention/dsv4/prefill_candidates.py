@@ -4,6 +4,26 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
+
+from .utils import make_name
+
+
+@cache_once
+def _candidate_topk_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("prefill_candidate_topk"),
+        *args,
+        cuda_files=["deepseek_v4/prefill_candidate_topk.cuh"],
+        cuda_wrappers=[("run", f"prefill_candidate::Kernel<{args}>::run")],
+    )
+
 
 @triton.jit
 def _causal_block_max(
@@ -37,11 +57,11 @@ def _causal_block_max(
     )
     # Match torch.amax, including propagation of NaNs in visible positions.
     scores = tl.max(values, axis=1)
-    scores = tl.where(tl.sum((values != values).to(tl.int32), axis=1) > 0, float("nan"), scores)
-    newest = (length - 1) // BLOCK_SIZE
     scores = tl.where(
-        (length > 0) & (blocks == newest), float("inf"), scores
+        tl.sum((values != values).to(tl.int32), axis=1) > 0, float("nan"), scores
     )
+    newest = (length - 1) // BLOCK_SIZE
+    scores = tl.where((length > 0) & (blocks == newest), float("inf"), scores)
     tl.store(
         SCORES + row * NUM_BLOCKS + blocks,
         scores,
@@ -93,11 +113,34 @@ def select_prefill_candidate_blocks(
     compress_lens: torch.Tensor,
     topk_blocks: int,
     block_size: int,
+    *,
+    compact: bool = False,
 ) -> torch.Tensor:
-    """Prefill-only candidate selection; retain the reference token-mask API."""
+    """Select candidate blocks; optionally retain one bool per block."""
     scores = causal_block_max(logits, compress_lens, block_size)
     top = scores.topk(min(topk_blocks, scores.shape[-1]), dim=-1)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
+    if compact:
+        return keep
     return keep.repeat_interleave(block_size, dim=-1)[..., : logits.shape[-1]]
+
+
+def topk_prefill_candidates(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_mask: torch.Tensor,
+    block_size: int,
+    out_offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Select within each query's candidate blocks, without modifying scores.
+
+    Columns are request-local, seq_lens are nonnegative and bounded by the score
+    width. Output indices include out_offsets; invalid slots are -1. Row strides
+    must be multiples of four floats for the vectorized top-k reads.
+    """
+    _candidate_topk_module().run(
+        scores, seq_lens, block_mask, out_offsets, out_indices, block_size
+    )

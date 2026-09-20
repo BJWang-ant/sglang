@@ -65,6 +65,18 @@ def make_candidate_indexer(
 # TODO(candidate): Hopper decode and prefill still select through these masks
 # inline in the backend; move them behind the protocol as publish/select_prefill.
 @dataclass
+class PrefillCandidateBlocks(CandidateMetadata):
+    """Dense-prefill candidates in rank-local query order, one bool per block."""
+
+    mask: torch.Tensor
+    block_size: int
+
+    def select_rows(self, rows: torch.Tensor) -> PrefillCandidateBlocks:
+        """Carry source candidates onto a DSpark/CP late-layer tail."""
+        return PrefillCandidateBlocks(self.mask.index_select(0, rows), self.block_size)
+
+
+@dataclass
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
