@@ -1400,8 +1400,8 @@ class DeepseekV4AttnBackend(
         return ""
 
     def glue_draft_metadata(self) -> str:
-        # The draft block prep is host-free (host inputs follow from bs, CPU lengths
-        # feed only asserts) except in these cases.
+        # Live sequence lengths stay on device; host geometry depends only on
+        # the batch and block sizes.
         for bad, why in (
             (not self.is_dspark_draft, "not the DSpark draft runner"),
             (self.needs_cpu_seq_lens, "host sequence lengths"),
