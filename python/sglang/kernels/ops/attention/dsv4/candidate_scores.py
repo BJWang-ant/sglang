@@ -1,9 +1,11 @@
-"""Candidate-only BF16 indexer matmul; keep eager head-score postprocessing unchanged."""
+"""Candidate-only BF16 indexer matmul with a fused head-score epilogue."""
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.attention.dsv4.index_score_reduce import reduce_head_scores
 
 
 @triton.jit
@@ -101,8 +103,8 @@ def candidate_scores(q, k, weights, blocks, lens, block_size=8):
             64,
             num_warps=4,
         )
-    # Deliberately preserve the baseline epilogue to isolate candidate reduction.
-    scores = (per_head.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
+    # Preserve BF16 rounding and Torch accumulation order while fusing the epilogue.
+    scores = reduce_head_scores(per_head, weights)
     if rows and width:
         _mask_scores[(rows, triton.cdiv(width, 256))](
             scores,
