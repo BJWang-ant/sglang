@@ -354,54 +354,6 @@ class DecodeScores(msgspec.Struct, frozen=True):
     scores: torch.Tensor  # [bs, lmax]
 
 
-def _torch_prefill_request_rows(inputs: PrefillInputs, compress_lens: torch.Tensor):
-    """Use scheduler lengths for ordinary contiguous extends; preserve CP fallback."""
-    ratio = inputs.compress_ratio
-    pos = inputs.positions
-    rows = inputs.rows_per_request
-    seq_lens = inputs.seq_lens_cpu
-    assert seq_lens is not None
-    if (
-        inputs.req_rows is not None
-        and rows is not None
-        and len(rows) == len(seq_lens) == inputs.req_pool_indices.numel()
-        and sum(rows) == pos.numel()
-        and all(n >= 0 for n in rows)
-    ):
-        start = k_start = 0
-        # Non-CP extend (including late-layer tails) keeps request rows in order,
-        # and each nonempty request ends at seq_lens_cpu[r] - 1.
-        for n, seq_len in zip(rows, seq_lens):
-            lc = seq_len // ratio
-            if n and lc:
-                tok = torch.arange(start, start + n, device=pos.device)
-                yield k_start, tok, compress_lens[start : start + n], lc
-            start += n
-            k_start += lc
-        return
-    req = inputs.req_rows
-    if req is None:
-        assert rows is not None
-        repeats = inputs.rows_per_request_device
-        if repeats is None:
-            repeats = async_h2d(rows, dtype=torch.int32, device=pos.device)
-        req = torch.repeat_interleave(
-            inputs.req_pool_indices, repeats, output_size=pos.numel()
-        )
-    k_starts = dict(
-        zip(
-            inputs.req_pool_indices.tolist(),
-            itertools.accumulate((s // ratio for s in seq_lens), initial=0),
-        )
-    )
-    for r in torch.unique_consecutive(req).tolist():
-        tok = (req == r).nonzero().squeeze(1)
-        lens = compress_lens[tok]
-        lc = int(lens.max().item())
-        if lc:
-            yield k_starts[r], tok, lens, lc
-
-
 def prefill_requests(
     *,
     inputs: PrefillInputs,
@@ -413,16 +365,40 @@ def prefill_requests(
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
-    pos = inputs.positions
+    req, pos = inputs.req_rows, inputs.positions
+    if req is None:
+        # CP query rows are rank-local and remain grouped by request.
+        assert inputs.rows_per_request is not None
+        repeats = inputs.rows_per_request_device
+        if repeats is None:
+            repeats = async_h2d(
+                inputs.rows_per_request, dtype=torch.int32, device=pos.device
+            )
+        req = torch.repeat_interleave(
+            inputs.req_pool_indices, repeats, output_size=pos.numel()
+        )
+    assert inputs.seq_lens_cpu is not None
+    # First flattened-K column of each request row, as inputs.k_slots lays them out.
+    k_starts = dict(
+        zip(
+            inputs.req_pool_indices.tolist(),
+            itertools.accumulate((s // ratio for s in inputs.seq_lens_cpu), initial=0),
+        )
+    )
     inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
-    for k_start, tok, lens, lc in _torch_prefill_request_rows(inputs, compress_lens):
+    for r in torch.unique_consecutive(req).tolist():
+        tok = (req == r).nonzero().squeeze(1)
+        lens = compress_lens[tok]
+        lc = int(lens.max().item())
+        if lc == 0:
+            continue
         j = torch.arange(lc, device=pos.device)
-        slots = inputs.k_slots[k_start : k_start + lc]
+        slots = inputs.k_slots[k_starts[r] : k_starts[r] + lc]
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
