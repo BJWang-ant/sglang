@@ -356,13 +356,16 @@ def index_k_rope_pack(
 
 @triton.jit
 def _e2m1_decode(code):
-    # code: uint 0..15 -> e2m1 value. exp = bits 2..1, mantissa = bit 0, sign = bit 3.
-    e = (code >> 1) & 3
-    m = (code & 1).to(tl.float32)
-    sub = m * 0.5
-    nor = (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32))
-    v = tl.where(e == 0, sub, nor)
-    return tl.where((code >> 3) == 1, -v, v)
+    # Valid E2M1 nibbles encode 0, .5, 1, 1.5, 2, 3, 4, 6 and their negatives.
+    # Construct the exact FP32 bits, including signed zero, without exp2.
+    code = code.to(tl.uint32)
+    magnitude = code & 7
+    bits = tl.where(
+        magnitude >= 2,
+        0x3F000000 + (magnitude << 22),
+        tl.where(magnitude == 1, 0x3F000000, 0),
+    ).to(tl.uint32)
+    return (bits | ((code & 8) << 28)).to(tl.float32, bitcast=True)
 
 
 @triton.jit

@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
@@ -13,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _e2m1_decode,
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
@@ -673,6 +676,26 @@ def test_flat_indexer_slot_count_does_not_recompile(write_raw):
             expected_raw = torch.where(chosen, selected - starts[:, None], -1)
             torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
     assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
+
+
+@triton.jit
+def _test_e2m1_decode_kernel(codes, output):
+    offsets = tl.arange(0, 16)
+    decoded = _e2m1_decode(tl.load(codes + offsets))
+    tl.store(output + offsets, decoded)
+
+
+@pytest.mark.skipif(_is_xpu, reason="Triton E2M1 decoding is tested on CUDA")
+def test_fp4_e2m1_decode_preserves_all_codes_and_signed_zero():
+    codes = torch.arange(16, dtype=torch.uint8, device=get_device())
+    actual = torch.empty(16, dtype=torch.float32, device=get_device())
+    _test_e2m1_decode_kernel[(1,)](codes, actual)
+    levels = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32, device=get_device()
+    )
+    expected = torch.cat((levels, -levels))
+    # A float comparison alone would miss a lost negative-zero sign bit.
+    torch.testing.assert_close(actual.view(torch.int32), expected.view(torch.int32))
 
 
 if __name__ == "__main__":
