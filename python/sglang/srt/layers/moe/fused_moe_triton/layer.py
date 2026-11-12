@@ -216,6 +216,7 @@ def create_moe_dispatcher(
     if (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
+        or a2a_backend.is_gc_moe()
         or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
     ):

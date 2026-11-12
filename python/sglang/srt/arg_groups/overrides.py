@@ -1798,6 +1798,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
+        "gc_moe",
         "deepep",
         "deepep_v2",
         "mooncake",
@@ -1817,6 +1818,8 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 def _a2a_backend_overrides(view: Any) -> dict:
 
     moe_a2a_backend = view.moe_a2a_backend
+    if moe_a2a_backend == "gc_moe" and view.enable_waterfill:
+        raise ValueError("gc_moe does not yet support Waterfill")
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
             "moe_a2a_backend is overridden to 'deepep' because Waterfill "

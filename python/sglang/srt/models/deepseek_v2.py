@@ -886,6 +886,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_gc_moe()
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
                 or get_moe_a2a_backend().is_ascend_ops()
@@ -1102,6 +1103,18 @@ class DeepseekV2MoE(nn.Module):
                 num_token_non_padded=num_token_non_padded,
             )
             return self._finalize_normal_output(output, None)
+
+        if get_moe_a2a_backend().is_gc_moe():
+            from sglang.srt.layers.moe.gc_moe import forward_gc_moe
+
+            return forward_gc_moe(
+                self,
+                hidden_states,
+                forward_batch,
+                input_ids_global=(
+                    input_ids_global if input_ids_global is not None else input_ids
+                ),
+            )
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(

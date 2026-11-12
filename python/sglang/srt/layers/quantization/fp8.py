@@ -2014,6 +2014,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if get_moe_a2a_backend().is_gc_moe():
+            if not self.is_fp4_expert or self.dequant_fp4_to_fp8:
+                raise ValueError(
+                    "GC-MoE requires packed MXFP4 experts without dequantization"
+                )
+            from sglang.srt.layers.moe.gc_moe import build_gc_moe_experts_weights
+
+            build_gc_moe_experts_weights(layer)
+            return
+
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.

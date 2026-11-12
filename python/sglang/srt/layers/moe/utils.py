@@ -44,6 +44,7 @@ class MoeA2ABackend(Enum):
     ASCEND_OPS = "ascend_ops"
     FLASHINFER = "flashinfer_nvlink_one_sided"
     MEGAMOE = "megamoe"
+    GC_MOE = "gc_moe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
@@ -89,6 +90,9 @@ class MoeA2ABackend(Enum):
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
+
+    def is_gc_moe(self):
+        return self == MoeA2ABackend.GC_MOE
 
     def is_deepep_v2(self):
         return self == MoeA2ABackend.DEEPEP_V2
@@ -870,7 +874,12 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     a2a = get_moe_a2a_backend()
     # The flashinfer and pplx combines, and the megamoe kernel's internal
     # combine, sum each token's expert outputs back to its source rank.
-    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+    return (
+        a2a.is_flashinfer()
+        or a2a.is_pplx()
+        or a2a.is_flashinfer_megamoe()
+        or a2a.is_gc_moe()
+    )
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:

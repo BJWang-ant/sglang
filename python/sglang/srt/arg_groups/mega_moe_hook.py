@@ -19,6 +19,36 @@ logger = logging.getLogger(__name__)
 def handle_mega_moe(server_args: ServerArgs) -> None:
     handle_moe_runner_backend_alias(server_args)
     check_mega_moe_compat(server_args)
+    check_gc_moe_compat(server_args)
+
+
+def check_gc_moe_compat(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.moe_a2a_backend != "gc_moe":
+        return
+    platform = get_platform()
+    if not (platform.is_cuda and platform.is_sm90):
+        raise ValueError("gc_moe currently requires CUDA SM90 (Hopper)")
+    if cfg.disaggregation_mode != "decode" or not cfg.language_model_only:
+        raise ValueError("gc_moe currently supports language-only decode workers")
+    if cfg.speculative_algorithm not in (None, "DSPARK"):
+        raise ValueError("gc_moe currently supports only DSPARK speculative decoding")
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        raise ValueError("gc_moe does not yet support TBO/SBO")
+    if cfg.max_running_requests is None or cfg.max_running_requests <= 0:
+        raise ValueError("gc_moe requires a positive --max-running-requests")
+    if cfg.enable_eplb or cfg.ep_num_redundant_experts or cfg.enable_waterfill:
+        raise ValueError(
+            "gc_moe currently requires static expert placement without Waterfill"
+        )
+    if cfg.moe_runner_backend != "humming" or not cfg.disable_shared_experts_fusion:
+        raise ValueError(
+            "gc_moe currently requires the humming loader and disabled shared-expert fusion"
+        )
+    if cfg.tp_size != (cfg.ep_size or 1) or cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+        raise ValueError("gc_moe currently requires TP=EP, PP1 and attention CP1")
+    if envs.SGLANG_OPT_GC_MOE_NUM_MAX_TOKENS_PER_RANK.get() <= 0:
+        raise ValueError("SGLANG_OPT_GC_MOE_NUM_MAX_TOKENS_PER_RANK must be positive")
 
 
 def check_mega_moe_compat(server_args: ServerArgs) -> None:

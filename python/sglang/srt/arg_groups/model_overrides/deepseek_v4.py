@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     model_config_of,
+    register_dspark_dp_a2a_backends,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 DSV4_PAGE_SIZE = 256
 # Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
 DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
+
+register_dspark_dp_a2a_backends(
+    "DeepseekV4ForCausalLM", ("none", "megamoe", "mori", "gc_moe")
+)
 
 
 @_register_for("DeepseekV4ForCausalLM")

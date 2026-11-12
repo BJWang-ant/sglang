@@ -875,6 +875,7 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_nvlink_one_sided",
             "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
+            "gc_moe",
             "deepep_v2",
             "ascend_ops",
             "pplx",
@@ -894,6 +895,7 @@ class ExecMoe(msgspec.Struct):
                 "flashinfer_nvlink_one_sided",
                 "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
+                "gc_moe",
                 "deepep_v2",
                 "pplx",
                 "ascend_ops",

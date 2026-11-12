@@ -17,6 +17,17 @@ __all__ = []
 
 register_kernel(
     KernelSpec(
+        op="communication.gc_moe_sm90",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.communication.gc_moe:sm90_gc_moe",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="communication.moe_finalize_shared_gate_all_reduce",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.communication.all_reduce_fusion:moe_finalize_shared_gate_all_reduce",

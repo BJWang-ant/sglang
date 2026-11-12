@@ -70,7 +70,9 @@ class Mxfp4HummingMoEMethod:
         # FP8 base normalization (ROCm-specific handling etc.)
         self._fp8.process_weights_after_loading(layer)
 
-        if getattr(layer, "_mega_moe_weights_built", False):
+        if getattr(layer, "_mega_moe_weights_built", False) or getattr(
+            layer, "_gc_moe_weights_built", False
+        ):
             return
 
         log_info_on_rank0(
