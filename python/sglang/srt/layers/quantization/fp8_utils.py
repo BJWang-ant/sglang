@@ -1704,9 +1704,10 @@ def _deepgemm_block_fp8_supported(
     if output_dtype != torch.bfloat16:
         return False
     n, k = weight_shape
-    if list(block_size) == [32, 32] and (
-        get_platform().is_sm90 or get_platform().is_sm100
-    ):
+    # DeepGEMM's SM90 scale transformer accepts block-128 only. Keep the
+    # original block-32 quantization on its Triton fallback instead of passing
+    # an unsupported recipe to DeepGEMM (including PR #473 builds).
+    if list(block_size) == [32, 32] and get_platform().is_sm100:
         return n % 8 == 0 and k % 32 == 0
     return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
 

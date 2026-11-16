@@ -22,6 +22,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -213,7 +214,12 @@ class PagedIndexerMetadata:
 
     def __post_init__(self):
         if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            is_hip()
+            or is_xpu()
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            # V4.1 low-ratio indexers use Torch on Hopper. Building an unused
+            # DeepGEMM schedule rejects DSpark's six-row verify groups there.
+            or (self.compress_ratio in (1, 2) and get_platform().is_sm90)
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
