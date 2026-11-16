@@ -29,7 +29,8 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
 from sglang.srt.layers.moe.mega_moe_sm90 import (
-    is_sm90_fp8_mega_moe_available,
+    build_sm90_mxfp4_mega_moe_experts_weights,
+    is_sm90_mega_moe_available,
     run_sm90_mega_routed,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -154,17 +155,33 @@ def _get_mega_moe_symm_buffer(
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
-            buf = deep_gemm.get_symm_buffer_for_mega_moe(
-                group,
-                num_experts,
-                num_max_tokens_per_rank,
-                num_topk,
-                hidden,
-                intermediate_hidden,
-                num_shared_experts=num_shared_experts,
-                mma_type=mma_type,
-                activation=activation,
-            )
+            if _device_sm == 90:
+                if num_shared_experts or mma_type not in ("fp8xfp4", "fp8xfp8"):
+                    raise ValueError(
+                        "SM90 MegaMoE supports FP8 or MXFP4 routed experts only."
+                    )
+                buf = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
+                    group,
+                    num_experts,
+                    num_max_tokens_per_rank,
+                    num_topk,
+                    hidden,
+                    intermediate_hidden,
+                    activation=activation,
+                    fused=mma_type == "fp8xfp4",
+                )
+            else:
+                buf = deep_gemm.get_symm_buffer_for_mega_moe(
+                    group,
+                    num_experts,
+                    num_max_tokens_per_rank,
+                    num_topk,
+                    hidden,
+                    intermediate_hidden,
+                    num_shared_experts=num_shared_experts,
+                    mma_type=mma_type,
+                    activation=activation,
+                )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
             # Only the SM100 kernels read the SM locality map.
             # Cache it and stop the MLOPart MPS helper, which blocks cuda-checkpoint.
@@ -202,7 +219,7 @@ def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
     if _device_sm == 90:
-        return is_sm90_fp8_mega_moe_available(experts)
+        return is_sm90_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
     return _device_sm // 10 == 10
 
@@ -230,7 +247,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     if max_tokens_per_rank <= cap:
         return True
-    assert not getattr(moe.experts, "_mega_moe_weights_localized", False), (
+    assert not (
+        getattr(moe.experts, "_mega_moe_weights_localized", False)
+        or getattr(moe.experts, "_mega_moe_sm90_mxfp4_weights", False)
+    ), (
         f"mega MoE: {max_tokens_per_rank} tokens per rank exceed "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK={cap}; localized "
         f"weights have no non-mega fallback — raise the env var to cover the "
@@ -759,6 +779,10 @@ def _mega_moe_sf_as_fp32(sf: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
+    if _device_sm == 90 and experts.w13_weight.dtype in (torch.int8, torch.uint8):
+        build_sm90_mxfp4_mega_moe_experts_weights(experts)
+        return
+
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (
             build_mega_moe_experts_weights as build_flydsl_mega_moe_weights,

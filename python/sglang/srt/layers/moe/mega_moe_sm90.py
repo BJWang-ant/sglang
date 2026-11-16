@@ -15,9 +15,19 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+
+try:
+    import deep_gemm
+except ImportError:
+    deep_gemm = None
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.models.deepseek_common.utils import _device_sm
 
@@ -25,17 +35,13 @@ if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
 
 
-def is_sm90_fp8_mega_moe_available(experts) -> bool:
-    if _device_sm != 90:
+def is_sm90_mega_moe_available(experts) -> bool:
+    if _device_sm != 90 or deep_gemm is None:
         return False
-    try:
-        import deep_gemm
-    except ImportError:
-        return False
-    return (
-        hasattr(deep_gemm, "fp8_mega_moe")
-        and hasattr(deep_gemm, "mega_moe_pre_dispatch_sm90")
-        and getattr(experts, "_mega_moe_sm90_fp8_weights", False)
+    if getattr(experts, "_mega_moe_sm90_mxfp4_weights", False):
+        return hasattr(deep_gemm, "fp8_mxfp4_mega_moe")
+    return hasattr(deep_gemm, "fp8_mega_moe") and getattr(
+        experts, "_mega_moe_sm90_fp8_weights", False
     )
 
 
@@ -51,32 +57,34 @@ def run_sm90_mega_routed(
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
-    import deep_gemm
-
-    deep_gemm.mega_moe_pre_dispatch_sm90(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        buf.x,
-        buf.x_sf,
-        buf.topk_idx,
-        buf.topk_weights,
-        num_tokens=num_tokens,
+    # SM90 takes FP32 scales per 128 values, unlike SM100's packed UE8M0.
+    # Reuse the existing graph-safe quantizer and write into the peer buffer.
+    sglang_per_token_group_quant_fp8(
+        hidden_states.contiguous(),
         group_size=128,
-        routed_scaling_factor=routed_scaling_factor,
+        output_q=buf.x[:num_tokens].view(torch.float8_e4m3fn),
+        output_s=buf.x_sf[:num_tokens],
     )
+    buf.topk_idx.fill_(-1)
+    buf.topk_weights.zero_()
+    buf.topk_idx[:num_tokens].copy_(topk_ids)
+    buf.topk_weights[:num_tokens].copy_(topk_weights)
+    if routed_scaling_factor != 1.0:
+        buf.topk_weights[:num_tokens].mul_(routed_scaling_factor)
 
     y = torch.empty(
         (max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    deep_gemm.fp8_mega_moe(
+    is_mxfp4 = getattr(experts, "_mega_moe_sm90_mxfp4_weights", False)
+    kernel = deep_gemm.fp8_mxfp4_mega_moe if is_mxfp4 else deep_gemm.fp8_mega_moe
+    kernel(
         y,
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
-        recipe=(128, 128, 128),
+        recipe=(1, 1, 32) if is_mxfp4 else (128, 128, 128),
         activation="swiglu",
         activation_clamp=activation_clamp,
         fast_math=True,
@@ -147,3 +155,35 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
 
     experts._mega_moe_sm90_fp8_weights = True
     experts._mega_moe_weights_built = True
+
+
+def build_sm90_mxfp4_mega_moe_experts_weights(experts) -> None:
+    """Convert checkpoint MXFP4 directly to PR #473's tiled Hopper layout."""
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+    if deep_gemm is None or not hasattr(
+        deep_gemm, "transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90"
+    ):
+        raise RuntimeError("SM90 MXFP4 MegaMoE requires DeepGEMM PR #473.")
+    l1, l2 = deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+        (experts.w13_weight.data, experts.w13_weight_scale_inv.data),
+        (experts.w2_weight.data, experts.w2_weight_scale_inv.data),
+        layout="tiled",
+    )
+    # Keep all transformed expert payloads in parameters so EPLB moves the
+    # secondary scale together with the packed values and relative scales.
+    experts.w13_weight.data = l1[0]
+    experts.w13_weight_scale_inv.data = l1[1]
+    experts.w2_weight.data = l2[0]
+    experts.w2_weight_scale_inv.data = l2[1]
+    experts.register_parameter(
+        "mega_w13_weight_scale_2", torch.nn.Parameter(l1[2], requires_grad=False)
+    )
+    experts.register_parameter(
+        "mega_w2_weight_scale_2", torch.nn.Parameter(l2[2], requires_grad=False)
+    )
+    experts.mega_l1_weights = l1
+    experts.mega_l2_weights = l2
+    experts._mega_moe_sm90_mxfp4_weights = True
+    experts._mega_moe_weights_built = True
+    logger.info("Prepared SM90 fused MXFP4 MegaMoE experts (DeepGEMM PR #473, tiled)")

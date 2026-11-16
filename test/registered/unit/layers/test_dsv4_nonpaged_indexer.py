@@ -43,6 +43,47 @@ _ISSUE_ALIGNED_COLS = 93184
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
+    def test_sm90_low_ratio_six_row_verify_uses_torch_metadata(self):
+        """Hopper's Torch indexer must not schedule unsupported next_n=6."""
+        for sm90, ratio in ((True, 1), (True, 2), (False, 2)):
+            with self.subTest(sm90=sm90, ratio=ratio):
+                expected = torch.zeros((133, 2), dtype=torch.int32)
+
+                def schedule(lens, *args, _sm90=sm90, _expected=expected):
+                    if _sm90 and lens.shape[1] not in (1, 2, 4):
+                        raise RuntimeError("SM90 DeepGEMM requires next_n=1/2/4")
+                    return _expected
+
+                deep_gemm = SimpleNamespace(
+                    get_num_sms=lambda: 132,
+                    get_paged_mqa_logits_metadata=schedule,
+                )
+                lens = torch.arange(6, dtype=torch.int32) + 64
+                table = torch.zeros((6, 2), dtype=torch.int32)
+                with (
+                    patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                    patch(
+                        f"{_METADATA}.get_platform",
+                        return_value=SimpleNamespace(is_sm90=sm90),
+                    ),
+                    patch(f"{_METADATA}.is_hip", return_value=False),
+                    patch(f"{_METADATA}.is_xpu", return_value=False),
+                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+                ):
+                    metadata = PagedIndexerMetadata(
+                        page_size=256,
+                        compressed_page_size=64,
+                        page_table=table,
+                        compressed_seq_lens=lens,
+                        use_topk_v2=False,
+                        compress_ratio=ratio,
+                        rows_per_request=6,
+                    )
+                self.assertIs(metadata.deep_gemm_metadata, None if sm90 else expected)
+                torch.testing.assert_close(metadata.compressed_seq_lens, lens)
+                torch.testing.assert_close(metadata.page_table, table)
+                self.assertEqual(metadata.rows_per_request, 6)
+
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
