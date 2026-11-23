@@ -54,7 +54,7 @@ from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
     _Graph,
 )
 from sglang.srt.models.deepseek_v4_mhc import HcState
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
@@ -578,6 +578,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                 original_global = batch.global_num_token_non_padded
                 output = torch.tensor([11])
                 tail_layers = SimpleNamespace(
+                    _last_run_replayed=True,
                     runner=SimpleNamespace(warm=True, bucket_rows=lambda n: 8),
                     _can_capture_moe_bound=(
                         replay_tail.DecoderReplayTail._can_capture_moe_bound
@@ -655,7 +656,7 @@ class TestDecoderReplayTailBridge(CustomTestCase):
 
 
 class TestCPDecoderTailGraph(CustomTestCase):
-    def test_cp_plan_uses_global_warm_size_and_only_local_megamoe_rows(self):
+    def test_cp_plan_uses_global_warm_size_and_supported_moe_transports(self):
         """CP tail eligibility must include its externally owned MoE count."""
         with (
             get_parallel().override(
@@ -692,7 +693,7 @@ class TestCPDecoderTailGraph(CustomTestCase):
             self.assertEqual(ready.call_args.args, (8192,))
             self.assertIsNot(cp.moe_local_token_count, batch.num_token_non_padded)
             for backend, tp, dp in (
-                (MoeA2ABackend.NONE, 1, 1),
+                (MoeA2ABackend.DEEPEP, 1, 1),
                 (MoeA2ABackend.MEGAMOE, 2, 1),
                 (MoeA2ABackend.MEGAMOE, 1, 2),
             ):
@@ -806,7 +807,9 @@ class TestCPDecoderTailGraph(CustomTestCase):
             tail_writes_source_kv=True, late_layer_start=20, end_layer=40
         )
         with (
-            get_parallel().override(attn_cp_size=4),
+            get_context().override_server_args(
+                tp_size=4, attn_cp_size=4, enable_decoder_tail_cuda_graph=True
+            ),
             replay_tail.envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(2048),
             replay_tail.envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
             patch.object(replay_tail, "is_cuda", return_value=True),

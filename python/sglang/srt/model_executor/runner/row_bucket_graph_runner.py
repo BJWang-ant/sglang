@@ -82,10 +82,13 @@ class _Graph:
 
 
 class RowBucketGraphRunner:
-    def __init__(self, *, row_step: int, max_rows: int, label: str) -> None:
+    def __init__(
+        self, *, row_step: int, max_rows: int, label: str, log_capture: bool = True
+    ) -> None:
         self.row_step = row_step
         self.max_rows = max_rows - max_rows % row_step
         self.label = label
+        self.log_capture = log_capture
         self._graphs: dict[tuple, _Graph] = {}
         self._static: dict[tuple, List[torch.Tensor]] = {}
         self._warm = False
@@ -372,7 +375,7 @@ class RowBucketGraphRunner:
         used = free_before - torch.cuda.mem_get_info()[0]
         self.capture_seconds += seconds
         self.capture_bytes += used
-        if get_parallel().tp_rank == 0:
+        if self.log_capture and get_parallel().tp_rank == 0:
             logger.info(
                 "%s: captured %d rows (%d segments) in %.2f s, %.3f GiB; "
                 "%d graphs, %.2f s, %.3f GiB",

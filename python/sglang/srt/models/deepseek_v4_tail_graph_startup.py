@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
+import tqdm
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -139,9 +140,14 @@ def _skip_reason(tail: DecoderReplayTail, model_runner: ModelRunner) -> str | No
             or cp.kind != ContextParallelStrategyKind.INTERLEAVE
             or p.attn_tp_size != 1
             or _TAIL_WINDOW % p.attn_cp_size
-            or not get_moe_a2a_backend().is_megamoe()
+            or not (
+                get_moe_a2a_backend().is_megamoe() or get_moe_a2a_backend().is_none()
+            )
         ):
-            return "CP tail graphs require interleave CP, attention TP=1 and MegaMoE"
+            return (
+                "CP tail graphs require interleave CP, attention TP=1 "
+                "and moe-a2a-backend=megamoe or none"
+            )
     return None
 
 
@@ -241,32 +247,49 @@ def capture_decoder_tail_graphs(
             tail._startup_warming = False
             tail.runner._warm = True
             tail._startup_capture = True
-            for bucket in range(rows, 0, -tail.runner.row_step):
-                lengths = lengths_for(bucket)
-                before = len(tail.runner._graphs)
-                with _startup_batch(model_runner, lengths) as batch:
-                    eager_runner.execute(batch)
-                if not tail._last_run_replayed or len(tail.runner._graphs) <= before:
-                    raise RuntimeError(
-                        f"Decoder tail startup did not capture local bucket {bucket}"
-                    )
-                if bcg_runner is not None:
+            with tqdm.tqdm(
+                range(rows, 0, -tail.runner.row_step),
+                disable=get_parallel().tp_rank != 0,
+            ) as progress:
+                for bucket in progress:
+                    if get_parallel().tp_rank == 0:
+                        num_tokens = bucket * cp_size
+                        local_rows = bucket
+                        avail_mem = device_module.mem_get_info()[0] / 2**30
+                        progress.set_description(
+                            f"Capturing decoder tail shape ({num_tokens=} "
+                            f"{local_rows=} {avail_mem=:.2f} GB)"
+                        )
+                    lengths = lengths_for(bucket)
+                    before = len(tail.runner._graphs)
                     with _startup_batch(model_runner, lengths) as batch:
-                        if bcg_runner.can_run_graph(batch):
-                            tail._last_run_replayed = False
-                            bcg_runner.execute(batch)
-                            if tail._last_run_replayed:
-                                bcg_buckets += 1
-                            elif getattr(bcg_runner, "enable_cp_bcg_capture", False):
-                                raise RuntimeError(
-                                    f"CP BCG startup did not replay tail bucket {bucket}"
+                        eager_runner.execute(batch)
+                    if (
+                        not tail._last_run_replayed
+                        or len(tail.runner._graphs) <= before
+                    ):
+                        raise RuntimeError(
+                            f"Decoder tail startup did not capture local bucket {bucket}"
+                        )
+                    if bcg_runner is not None:
+                        with _startup_batch(model_runner, lengths) as batch:
+                            if bcg_runner.can_run_graph(batch):
+                                tail._last_run_replayed = False
+                                bcg_runner.execute(batch)
+                                if tail._last_run_replayed:
+                                    bcg_buckets += 1
+                                elif getattr(
+                                    bcg_runner, "enable_cp_bcg_capture", False
+                                ):
+                                    raise RuntimeError(
+                                        f"CP BCG startup did not replay tail bucket {bucket}"
+                                    )
+                            else:
+                                logger.info(
+                                    "Decoder tail startup: outer BCG ineligible for "
+                                    "local bucket %s; eager variant prepared",
+                                    bucket,
                                 )
-                        else:
-                            logger.info(
-                                "Decoder tail startup: outer BCG ineligible for "
-                                "local bucket %s; eager variant prepared",
-                                bucket,
-                            )
     finally:
         tail._startup_capture = False
         tail._startup_warming = False

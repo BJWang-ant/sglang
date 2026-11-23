@@ -204,6 +204,7 @@ from sglang.srt.models.deepseek_v4_platform_stage import (
 from sglang.srt.models.deepseek_v4_replay_tail import (
     DecoderReplayTail,
     bcg_tail_kv_store,
+    gather_cp_tail_ids,
     in_replay_tail_graph,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
@@ -4327,7 +4328,10 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
                 if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+                    get_moe_a2a_backend().is_none()
+                    and (
+                        get_parallel().attn_dp_size > 1 or tail.cp_metadata is not None
+                    )
                 ):
                     input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
@@ -4348,6 +4352,10 @@ class DeepseekV4Model(nn.Module):
                     residual_batch.clear(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
+                if tail.cp_metadata is not None and get_moe_a2a_backend().is_none():
+                    input_ids_global = gather_cp_tail_ids(
+                        input_ids, self.late_layer_vl_routing
+                    )
             if use_tail_graph and tail is None and i == self.late_layer_start:
                 residual, pre, aux = self.decoder_replay_tail.run_idle(
                     state=state,

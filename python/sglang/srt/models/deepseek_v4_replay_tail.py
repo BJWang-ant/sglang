@@ -30,7 +30,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
-    cp_sequence_to_interleave_order,
+    attn_cp_interleave_gather,
 )
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -79,7 +79,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
 )
 from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.models.deepseek_v4_tail_graph_startup import capture_decoder_tail_graphs
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -141,6 +141,15 @@ def _tail_kv_store(attention, x, positions, qkv_a) -> None:
 bcg_tail_kv_store = eager_on_graph(True)(_tail_kv_store)
 
 
+def gather_cp_tail_ids(
+    input_ids: torch.Tensor, vl_routing: bool
+) -> Optional[torch.Tensor]:
+    """Match the rank-major CP MoE operands, including each rank's padding."""
+    if not vl_routing:
+        return None
+    return attn_cp_interleave_gather(input_ids[:, None]).squeeze(-1)
+
+
 def _flatten_state(state: HcState):
     """The state's row tensors, whether ``pre`` is among them, and the inverse.
     The normed input and mix stats are dropped (the first tail layer rebuilds
@@ -168,13 +177,15 @@ class DecoderReplayTail:
         self._layer_ids = layer_ids
         self._layers = None
         self.runner = RowBucketGraphRunner(
-            row_step=row_step, max_rows=max_rows, label="Decoder tail graph"
+            row_step=row_step,
+            max_rows=max_rows,
+            label="Decoder tail graph",
+            log_capture=False,
         )
         self._startup_capture = False
         self._startup_prepared = False
         self._startup_warming = False
         self._last_run_replayed = False
-        self._missing_graphs: set[tuple] = set()
         self._static_ids_global: dict[torch.dtype, torch.Tensor] = {}
         # Older, smaller sets stay alive for the graphs that write and read them.
         self._bridge_buffers: dict[tuple, List[List[Optional[torch.Tensor]]]] = {}
@@ -189,7 +200,12 @@ class DecoderReplayTail:
 
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
-        max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
+        # Keep the CP BCG bridge when dedicated tail graphs are not requested.
+        max_rows = (
+            envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
+            if get_exec().graph.enable_decoder_tail_cuda_graph
+            else 0
+        )
         row_graphs = max_rows > 0 and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
         if not (model.tail_writes_source_kv and is_cuda()):
             return None
@@ -232,7 +248,8 @@ class DecoderReplayTail:
 
     @staticmethod
     def _can_capture_cp_tail(tail: LateLayerTail) -> bool:
-        # TP-MoE captures layout-dependent CP reorders/collectives; keep it eager.
+        # NONE uses fixed-shape rank-major CP gather/reduce-scatter; MegaMoE
+        # keeps the local rows. Both leave live attention metadata in eager breaks.
         cp = tail.cp_metadata
         parallel = get_parallel()
         return (
@@ -242,7 +259,7 @@ class DecoderReplayTail:
             and parallel.attn_cp_size > 1
             and parallel.attn_tp_size == 1
             and parallel.attn_dp_size == 1
-            and get_moe_a2a_backend().is_megamoe()
+            and (get_moe_a2a_backend().is_megamoe() or get_moe_a2a_backend().is_none())
             and cp.per_rank_logical_token is not None
             and len(cp.per_rank_logical_token) == parallel.attn_cp_size
             and cp.per_rank_actual_token is not None
@@ -391,6 +408,8 @@ class DecoderReplayTail:
         """Returns views of graph buffers valid until the next replay, cut to
         ``out_rows`` rows. Under DP every rank replays the bucket of the largest
         ``dp_rows``."""
+        replay_batch = forward_batch
+        replay_batch.tail_cuda_graph_replayed = False
         if forward_batch.forward_mode.is_idle():
             # An idle DP rank runs the extend's graph, with no rows of its own.
             forward_batch = copy.copy(forward_batch)
@@ -414,16 +433,17 @@ class DecoderReplayTail:
                 forward_batch.num_token_non_padded = torch.zeros(
                     (), dtype=torch.int32, device=positions.device
                 )
+        cp_gather = cp_tail and get_moe_a2a_backend().is_none()
         gather = dp_rows is not None and get_moe_a2a_backend().is_none()
         # Ranks in the DP layout the MoE sees: all of them when it gathers.
         layout = None if dp_rows is None else (len(dp_rows) if gather else 1)
-        gather_ids = gather and self._model.late_layer_vl_routing
+        gather_ids = (gather or cp_gather) and self._model.late_layer_vl_routing
         if input_ids_global is None:
             input_ids_global = input_ids
         leaves, has_pre, rebuild = _flatten_state(state)
         num_state = len(leaves)
         live = [*leaves, positions, input_ids]
-        if not gather:
+        if not (gather or cp_gather):
             live.append(input_ids_global)
         # Eager and outer-BCG forwards can choose different fused producers.
         # Keep their recordings separate even when tensor shapes are identical.
@@ -433,6 +453,7 @@ class DecoderReplayTail:
             layout,
             gather_ids,
             cp_size,
+            cp_gather,
             get_forward().is_extend_in_batch,
             is_in_prefill_graph_scope(),
         )
@@ -452,19 +473,6 @@ class DecoderReplayTail:
             bucket_from=None if dp_rows is None else max(dp_rows),
             global_num_rows=global_num_rows,
         ):
-            missing = (
-                key,
-                self.runner.bucket_rows(
-                    positions.shape[0] if dp_rows is None else max(dp_rows)
-                ),
-            )
-            if missing not in self._missing_graphs:
-                logger.info(
-                    "Decoder tail graph: startup graph unavailable for %s; "
-                    "using eager (runtime capture disabled)",
-                    missing,
-                )
-                self._missing_graphs.add(missing)
             return self._run_layers_eagerly(
                 state=state,
                 positions=positions,
@@ -476,13 +484,17 @@ class DecoderReplayTail:
             )
         ids_global = (
             self._ids_global_buffer(input_ids.dtype, len(dp_rows))
-            if gather_ids
+            if gather and gather_ids
             else None
         )
 
         def body(inputs: List[torch.Tensor], batch: ForwardBatch):
             rows = inputs[0].shape[0]
-            if not gather:
+            if cp_gather:
+                # Gather bucket-sized IDs inside the graph, just like MoE rows.
+                # Live global IDs have cp_size * live_rows, not bucket_rows.
+                ids = gather_cp_tail_ids(inputs[num_state + 1], gather_ids)
+            elif not gather:
                 ids = inputs[num_state + 2]
             else:
                 ids = None if ids_global is None else ids_global[: rows * layout]
@@ -502,6 +514,13 @@ class DecoderReplayTail:
                 # CP KV gathers/indexers read the live batch in eager breaks.
                 # Captured MoE kernels read a graph-owned local count.
                 saved_cp = batch.attn_cp_metadata
+                if cp_gather:
+                    logical = saved_cp.per_rank_logical_token[
+                        get_parallel().attn_cp_rank
+                    ]
+                    # NONE routes every gathered row; clear stale bucket padding.
+                    for value in inputs:
+                        value[logical:].zero_()
                 batch.attn_cp_metadata = copy.copy(saved_cp)
                 batch.attn_cp_metadata.moe_local_token_count = (
                     batch.num_token_non_padded
@@ -549,6 +568,7 @@ class DecoderReplayTail:
             capture_all_buckets=False,
         )
         self._last_run_replayed = True
+        replay_batch.tail_cuda_graph_replayed = True
         return residual, pre, aux
 
     def run_idle(
@@ -600,6 +620,16 @@ class DecoderReplayTail:
         if dp_rows is not None:
             saved_dp = enter_late_layer_dp(tail_batch, dp_rows)
         try:
+            if (
+                isinstance(
+                    tail_batch.attn_cp_metadata, InterleaveContextParallelMetadata
+                )
+                and tail_batch.attn_cp_metadata.local_index is not None
+                and get_moe_a2a_backend().is_none()
+            ):
+                input_ids_global = gather_cp_tail_ids(
+                    input_ids, self._model.late_layer_vl_routing
+                )
             if gather and self._model.late_layer_vl_routing:
                 gathered = input_ids.new_empty((sum(dp_rows), 1))
                 dp_gather_replicate(gathered, input_ids[:, None].clone(), tail_batch)
@@ -890,8 +920,9 @@ def _tail_layers_in_prefill_graph(
     # The tail captures its row-bucket graphs on first use.
     note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
+    graph_batch = get_tc_piecewise_forward_context().forward_batch
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
-        backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
+        backend, graph_batch, source_kv_layer_id
     )
     try:
         tail = backend.forward_metadata.late_layer_tail
@@ -936,15 +967,19 @@ def _tail_layers_in_prefill_graph(
         )
         # Capture stream and pool are busy while the prefill graphs capture.
         runner = tail_layers.runner
-        if (
+        use_tail_graph = (
             not get_flags().dp.capturing_prefill_graph
             and runner.warm
             and tail_layers._can_capture_moe_bound(forward_batch)
             and runner.bucket_rows(max(dp_rows) if dp else num_rows) is not None
-        ):
+        )
+        if use_tail_graph:
             residual, pre, aux = tail_layers.run(**kwargs)
         else:
             residual, pre, aux = tail_layers._run_layers_eagerly(**kwargs)
+        graph_batch.tail_cuda_graph_replayed = (
+            use_tail_graph and tail_layers._last_run_replayed
+        )
         tail_layers._write_bridge(
             bridge_key, block_rows, bridge, outputs=[residual, pre, *aux]
         )
@@ -975,14 +1010,8 @@ def _cp_tail_layers_in_prefill_graph(
     try:
         tail_ids = tail.rows(input_ids)
         if get_moe_a2a_backend().is_none():
-            # TP MoE sees the CP all-gather's rank-major order. Tail ownership
-            # follows the ORIGINAL extend, not interleaving the compact tail.
-            global_ids = forward_batch.input_ids[tail.global_token_indices]
-            ids_global = cp_sequence_to_interleave_order(
-                global_ids,
-                forward_batch,
-                sum(tail.cp_metadata.per_rank_actual_token),
-            )
+            # The tail gathers local IDs in the same rank-major order as MoE.
+            ids_global = None
         else:
             ids_global = tail_ids
         use_tail_graph = False
@@ -1012,6 +1041,7 @@ def _cp_tail_layers_in_prefill_graph(
         )
 
         use_tail_graph = use_tail_graph and tail_layers._last_run_replayed
+        forward_batch.tail_cuda_graph_replayed = use_tail_graph
 
         def scatter(value):
             if value is None:
@@ -1028,28 +1058,6 @@ def _cp_tail_layers_in_prefill_graph(
             bridge,
             outputs=[scatter(t) for t in (residual, pre, *aux)],
         )
-        reported = (
-            "_cp_tail_graph_reported" if use_tail_graph else "_cp_tail_eager_reported"
-        )
-        if (
-            not get_flags().dp.capturing_prefill_graph
-            and getattr(backend, "prefill_graph_replay_batch", None) is not None
-            and tail.global_token_indices.numel()
-            < sum(forward_batch.extend_seq_lens_cpu)
-            and not getattr(tail_layers, reported, False)
-        ):
-            logger.info(
-                "Decoder SWA bounded replay active in CP BCG: "
-                "cp_rank=%s, full_local_rows=%s, tail_local_rows=%s, "
-                "padded_tail_local_rows=%s, tail_global_rows=%s, late_layers=%s",
-                get_parallel().attn_cp_rank,
-                input_ids.shape[0],
-                tail.token_indices.numel(),
-                tail.positions.shape[0],
-                tail.global_token_indices.numel(),
-                "graph" if use_tail_graph else "eager",
-            )
-            setattr(tail_layers, reported, True)
     finally:
         backend.exit_late_layer_tail(saved, forward_batch)
 

@@ -1,11 +1,14 @@
 """CP bounded replay preserves compact global rows through logits and DSpark."""
 
+import argparse
 import contextlib
+import io
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -27,13 +30,14 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.model_executor.runner import eager_runner
+from sglang.srt.model_executor.runner import eager_runner, prefill_cuda_graph_runner
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_prefill_graph_scope,
     prefill_graph_scope,
 )
 from sglang.srt.models import deepseek_v4, deepseek_v4_nextn, deepseek_v4_replay_tail
+from sglang.srt.models.deepseek_common import moe_transport
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.runtime_context import (
@@ -599,6 +603,8 @@ class TestCpBoundedBCGBridge(CustomTestCase):
                 deepseek_v4_replay_tail.DecoderReplayTail
             )
             owner._bridge_buffers = {}
+            owner._model = SimpleNamespace(late_layer_vl_routing=True)
+            owner._break_context = lambda batch: contextlib.nullcontext()
             # These cases exercise bridge/fallback semantics, not CUDA dispatch.
             owner.plan = mock.Mock(return_value=(False, None))
             bridge = None
@@ -614,10 +620,10 @@ class TestCpBoundedBCGBridge(CustomTestCase):
                 )
                 tail = backend.tail_forward_metadata.late_layer_tail
                 local = torch.arange(100, dtype=torch.float32).view(100, 1, 1)
-                ids = torch.arange(100)
+                ids = torch.arange(2, 402, 4)
 
-                def layers(*, tail=tail, backend=backend, moe=moe, **kwargs):
-                    state = kwargs["state"].residual[:, 0]
+                def layers(state, *, tail=tail, backend=backend, moe=moe, **kwargs):
+                    state = state.residual[:, 0]
                     self.assertEqual(state.shape[0], tail.positions.shape[0])
                     self.assertEqual(backend.tail_source_kv_layer_id, 12)
                     if moe == MoeA2ABackend.NONE:
@@ -632,8 +638,24 @@ class TestCpBoundedBCGBridge(CustomTestCase):
                         )
                     return state + 1000, state + 2000, [state + 3000]
 
-                owner._run_layers_eagerly = layers
+                def gather(local_ids):
+                    indices = tail.global_token_indices.tolist()
+                    cap = max(tail.cp_metadata.per_rank_actual_token)
+                    expected = []
+                    for rank in range(4):
+                        owned = [i for i in indices if i % 4 == rank]
+                        expected.extend(owned + [0] * (cap - len(owned)))
+                    expected = torch.tensor(expected).reshape(4, cap, 1)
+                    torch.testing.assert_close(local_ids, expected[2])
+                    return expected.flatten(0, 1)
+
+                owner._layer_stack = layers
                 with (
+                    mock.patch.object(
+                        deepseek_v4_replay_tail,
+                        "attn_cp_interleave_gather",
+                        side_effect=gather,
+                    ),
                     get_flags().moe.override(a2a_backend=moe),
                     mock.patch.object(
                         deepseek_v4_replay_tail,
@@ -746,54 +768,123 @@ class TestCpBoundedBCGBridge(CustomTestCase):
         torch.testing.assert_close(args[4], full_aux[indices])
         torch.testing.assert_close(output.hidden_states_token_indices, indices)
 
-    def test_runtime_activation_evidence_ignores_short_health_probes(self):
-        """A short health probe must not consume the one-time trimming evidence."""
-        with self._cp_rank(1):
-            owner = deepseek_v4_replay_tail.DecoderReplayTail.__new__(
-                deepseek_v4_replay_tail.DecoderReplayTail
+    @contextlib.contextmanager
+    def _tail_status_fixture(self, lengths):
+        with (
+            self._cp_rank(1),
+            get_flags().dp.override(capturing_prefill_graph=False),
+            mock.patch.object(
+                deepseek_v4_replay_tail,
+                "get_global_expert_distribution_recorder",
+                return_value=SimpleNamespace(recording=False),
+            ),
+        ):
+            owner = deepseek_v4_replay_tail.DecoderReplayTail(
+                model=None, layer_ids=range(1), row_step=32, max_rows=512
             )
-            owner._bridge_buffers = {}
-            # These cases exercise bridge/fallback semantics, not CUDA dispatch.
-            owner.plan = mock.Mock(return_value=(False, None))
-            owner._run_layers_eagerly = lambda **kwargs: (
-                kwargs["state"].residual,
-                None,
-                [],
-            )
-            for lengths, trimmed in (([4, 8, 2], False), ([259, 131, 2], True)):
-                backend, batch = self._backend_and_batch(lengths, 1)
-                backend.prefill_graph_replay_batch = batch
-                logs = (
-                    self.assertLogs(deepseek_v4_replay_tail.logger, level="INFO")
-                    if trimmed
-                    else self.assertNoLogs(deepseek_v4_replay_tail.logger, level="INFO")
+            owner.runner._warm = True
+            backend, batch = self._backend_and_batch(lengths, 1)
+            backend.prefill_graph_replay_batch = batch
+            replay = SimpleNamespace(succeeded=True, batch=batch)
+
+            def layers(**kwargs):
+                return kwargs["state"].residual, None, []
+
+            def run(**kwargs):
+                # CUDA execution boundary: a planned graph can still miss its key.
+                owner._last_run_replayed = replay.succeeded
+                return layers(**kwargs)
+
+            def execute():
+                deepseek_v4_replay_tail._cp_tail_layers_in_prefill_graph(
+                    owner,
+                    lambda values: HcState(values[0]),
+                    False,
+                    12,
+                    (False, False),
+                    owner._bridge((False, False), 100),
+                    [torch.zeros(100, 1, 2)],
+                    torch.arange(100),
                 )
-                with (
-                    mock.patch.object(
-                        deepseek_v4_replay_tail,
-                        "get_attn_backend",
-                        return_value=backend,
-                    ),
-                    mock.patch.object(
-                        deepseek_v4_replay_tail,
-                        "get_tc_piecewise_forward_context",
-                        return_value=SimpleNamespace(forward_batch=batch),
-                    ),
-                    logs as captured,
-                ):
-                    deepseek_v4_replay_tail._cp_tail_layers_in_prefill_graph(
-                        owner,
-                        lambda values: HcState(values[0]),
-                        False,
-                        12,
-                        (False, False),
-                        owner._bridge((False, False), 100),
-                        [torch.zeros(100, 1, 2)],
-                        torch.arange(100),
-                    )
-                if trimmed:
-                    self.assertIn("tail_global_rows=258", captured.output[0])
-                    self.assertIn("late_layers=eager", captured.output[0])
+
+            with (
+                mock.patch.object(owner, "run", side_effect=run),
+                mock.patch.object(owner, "_run_layers_eagerly", side_effect=layers),
+                mock.patch.object(
+                    deepseek_v4_replay_tail, "get_attn_backend", return_value=backend
+                ),
+                mock.patch.object(
+                    deepseek_v4_replay_tail,
+                    "get_tc_piecewise_forward_context",
+                    return_value=SimpleNamespace(forward_batch=batch),
+                ),
+            ):
+                yield owner, replay, execute
+
+    def test_tail_status_tracks_each_batch_without_separate_messages(self):
+        """A replay, then a miss, must report fresh status without standalone logs."""
+        for lengths in ([259, 131, 2], [4, 8, 2]):
+            with (
+                self.subTest(lengths=lengths),
+                self._tail_status_fixture(lengths) as (owner, replay, execute),
+            ):
+                for succeeded in (True, False, True):
+                    replay.succeeded = succeeded
+                    with self.assertNoLogs(
+                        deepseek_v4_replay_tail.logger, level="INFO"
+                    ):
+                        execute()
+                    self.assertIs(replay.batch.tail_cuda_graph_replayed, succeeded)
+                # A subsequent oversized/disabled bucket must clear a prior hit.
+                owner.runner.max_rows = 0
+                with self.assertNoLogs(deepseek_v4_replay_tail.logger, level="INFO"):
+                    execute()
+                self.assertIs(replay.batch.tail_cuda_graph_replayed, False)
+
+    def test_prefill_runner_returns_static_tail_status_without_stale_hits(self):
+        """BCG's private batch must report to the caller and clear the next miss."""
+        module = prefill_cuda_graph_runner
+        runner = module.PrefillCudaGraphRunner.__new__(module.PrefillCudaGraphRunner)
+        static = SimpleNamespace(
+            input_ids=torch.arange(4), tail_cuda_graph_replayed=True
+        )
+        runner.raw_num_tokens = 4
+        runner.enable_cp_bcg_capture = True
+        runner.backend = SimpleNamespace(replay_session=contextlib.nullcontext)
+        runner.model_runner = None
+        runner.device_module = None
+        output = object()
+        calls = []
+
+        def execute(*args, **kwargs):
+            if not calls:
+                static.tail_cuda_graph_replayed = True
+            calls.append(True)
+            return output
+
+        with (
+            mock.patch.object(runner, "_validate_capture_hidden_mode"),
+            mock.patch.object(
+                runner, "model_context", side_effect=contextlib.nullcontext
+            ),
+            mock.patch.object(runner, "load_batch", return_value=(static, None)),
+            mock.patch.object(
+                runner, "_shape_key", return_value=SimpleNamespace(variant_label=None)
+            ),
+            mock.patch.object(runner, "_wait_for_layer_loads"),
+            mock.patch.object(
+                runner, "_finalize_execute_output", side_effect=lambda value: value
+            ),
+            mock.patch.object(module, "maybe_publish_prefill_shared_read_done"),
+            mock.patch.object(module, "execute_prefill_cp_bcg", side_effect=execute),
+        ):
+            first = SimpleNamespace(tail_cuda_graph_replayed=False)
+            second = SimpleNamespace(tail_cuda_graph_replayed=False)
+            self.assertIs(runner.execute(first), output)
+            self.assertIs(first.tail_cuda_graph_replayed, True)
+            self.assertIs(runner.execute(second), output)
+            self.assertIs(second.tail_cuda_graph_replayed, False)
+            self.assertIs(first.tail_cuda_graph_replayed, True)
 
     def test_bounded_bcg_selects_cp_adapter_and_prepares_capture_metadata(self):
         """An enabled bounded tail must not bypass CP input/metadata preparation."""
@@ -1002,9 +1093,10 @@ class TestCpBoundedBCGBridge(CustomTestCase):
         with (
             self._cp_rank(0),
             get_exec().graph.override(
+                enable_decoder_tail_cuda_graph=True,
                 cuda_graph_config=CudaGraphConfig(
                     prefill=PhaseConfig(backend=Backend.BREAKABLE)
-                )
+                ),
             ),
             envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(0),
             mock.patch.object(deepseek_v4_replay_tail, "is_cuda", return_value=True),
@@ -1228,7 +1320,9 @@ class TestTailGraphStartup(CustomTestCase):
     """Serving must replay startup graphs without recording new CUDA work."""
 
     @contextlib.contextmanager
-    def _fixture(self, cp_size, chunk=16384):
+    def _fixture(
+        self, cp_size, chunk=16384, moe_backend=MoeA2ABackend.MEGAMOE, ep_size=1
+    ):
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
@@ -1290,6 +1384,9 @@ class TestTailGraphStartup(CustomTestCase):
         def layers(state, **kwargs):
             x = state.streams[:, 0]
             count = get_forward_context().moe_num_token_non_padded()
+            if moe_backend.is_none():
+                self.assertIsNone(count)
+                count = kwargs["forward_batch"].num_token_non_padded
             bias = 1000 if is_in_prefill_graph_scope() else 0
             arithmetic.append((x, count, bias))
             return x + count + bias, None, []
@@ -1327,7 +1424,9 @@ class TestTailGraphStartup(CustomTestCase):
                 "state": HcState(values),
                 "positions": cp_tail.positions,
                 "input_ids": torch.arange(physical),
-                "input_ids_global": None,
+                "input_ids_global": (
+                    torch.arange(physical * cp_size) if moe_backend.is_none() else None
+                ),
                 "forward_batch": batch,
                 "capture_dspark": False,
             }
@@ -1354,18 +1453,21 @@ class TestTailGraphStartup(CustomTestCase):
             get_context().override_server_args(
                 chunked_prefill_size=chunk,
                 tp_size=cp_size,
+                ep_size=ep_size,
+                moe_a2a_backend=moe_backend.value,
                 attn_cp_size=cp_size,
                 enable_prefill_cp=True,
                 cp_strategy="interleave",
             ),
             get_parallel().override(
+                tp_rank=0,
                 attn_cp_size=cp_size,
                 attn_cp_rank=0,
                 attn_tp_size=1,
                 attn_dp_size=1,
                 pp_size=1,
             ),
-            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            get_flags().moe.override(a2a_backend=moe_backend),
             get_flags().dp.override(capturing_prefill_graph=False),
             mock.patch.object(
                 cp_base,
@@ -1381,6 +1483,12 @@ class TestTailGraphStartup(CustomTestCase):
                 deepseek_v4_replay_tail,
                 "get_global_expert_distribution_recorder",
                 return_value=SimpleNamespace(recording=False),
+            ),
+            mock.patch(
+                "sglang.srt.layers.attention.dsa.utils.process_model_config",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+                ),
             ),
             mock.patch.object(startup, "is_unified_kv_triton", return_value=False),
             mock.patch.object(torch, "get_device_module", return_value=device),
@@ -1408,6 +1516,84 @@ class TestTailGraphStartup(CustomTestCase):
                 startup=startup,
                 make_inputs=make_inputs,
             )
+
+    def test_default_tail_graphs_skip_startup_but_keep_cp_bcg_bridge(self):
+        """Default CP BCG must retain its eager tail without allocating tail graphs."""
+        with (
+            self._fixture(4) as f,
+            get_exec().graph.override(
+                cuda_graph_config=CudaGraphConfig(
+                    prefill=PhaseConfig(backend=Backend.BREAKABLE)
+                )
+            ),
+            envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(2048),
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+            mock.patch.object(deepseek_v4_replay_tail, "is_cuda", return_value=True),
+        ):
+            model = SimpleNamespace(
+                tail_writes_source_kv=True, late_layer_start=20, end_layer=40
+            )
+            owner = deepseek_v4_replay_tail.DecoderReplayTail.maybe_create(model)
+            self.assertIsNotNone(owner)
+            self.assertEqual(list(owner._layer_ids), list(range(20, 40)))
+            self.assertEqual(owner.runner.max_rows, 0)
+            self.assertEqual(owner.capture_at_startup(f.runner, f.eager), (0.0, 0.0))
+            self.assertEqual(f.allocations, [])
+            self.assertEqual(f.calls, [])
+            self.assertEqual(owner.runner._graphs, {})
+            self.assertEqual(owner.runner._static, {})
+
+    def test_tail_graph_cli_is_independent_of_prefill_backend(self):
+        """Disabling prefix graphs must neither opt into nor override tail graphs."""
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        model = SimpleNamespace(
+            tail_writes_source_kv=True, late_layer_start=20, end_layer=40
+        )
+        for backend in (Backend.DISABLED, Backend.BREAKABLE):
+            for enabled in (False, True):
+                with self.subTest(backend=backend, enabled=enabled):
+                    cli = parser.parse_args(
+                        [
+                            "--model-path",
+                            "dummy",
+                            "--cuda-graph-backend-prefill",
+                            backend,
+                        ]
+                        + (["--enable-decoder-tail-cuda-graph"] if enabled else [])
+                    )
+                    with (
+                        self._fixture(4),
+                        get_exec().graph.override(
+                            enable_decoder_tail_cuda_graph=cli.enable_decoder_tail_cuda_graph,
+                            cuda_graph_config=CudaGraphConfig(
+                                prefill=PhaseConfig(
+                                    backend=cli.cuda_graph_backend_prefill
+                                )
+                            ),
+                        ),
+                        envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(2048),
+                        envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+                        mock.patch.object(
+                            deepseek_v4_replay_tail, "is_cuda", return_value=True
+                        ),
+                    ):
+                        owner = deepseek_v4_replay_tail.DecoderReplayTail.maybe_create(
+                            model
+                        )
+                        if backend == Backend.DISABLED and not enabled:
+                            self.assertIsNone(owner)
+                        else:
+                            self.assertIsNotNone(owner)
+                            self.assertEqual(
+                                owner.runner.max_rows, 512 if enabled else 0
+                            )
+                            self.assertEqual(
+                                owner.runner.bucket_rows(1), 32 if enabled else None
+                            )
+                        self.assertEqual(
+                            get_exec().graph.cuda_graph_config.prefill.backend, backend
+                        )
 
     def test_startup_covers_cp_buckets_and_serving_never_recaptures(self):
         """A prefilled cache must serve small padded tails with fresh MoE counts."""
@@ -1470,9 +1656,237 @@ class TestTailGraphStartup(CustomTestCase):
                 )
                 self.assertEqual(len(f.records), counts)
 
+    def test_tp_moe_startup_covers_cp_buckets(self):
+        """NONE/Humming CP workers must prepare their tails before serving."""
+        for cp_size in (2, 4, 8):
+            with (
+                self.subTest(cp_size=cp_size),
+                self._fixture(cp_size, moe_backend=MoeA2ABackend.NONE) as f,
+            ):
+                f.owner.capture_at_startup(f.runner, f.eager)
+                self.assertTrue(f.owner._startup_prepared)
+                self.assertEqual(
+                    [rows for rows, _ in f.records],
+                    list(range(2048 // cp_size, 0, -128 // cp_size)),
+                )
+                captured = len(f.records)
+                with f.startup._startup_batch(f.runner, [65]) as batch:
+                    _, inputs = f.make_inputs(batch)
+                    value, _, _ = f.owner.run(**inputs)
+                    self.assertTrue(f.owner._last_run_replayed)
+                    torch.testing.assert_close(
+                        value,
+                        inputs["state"].streams[:, 0]
+                        + batch.attn_cp_metadata.per_rank_logical_token[0],
+                    )
+                self.assertEqual(len(f.records), captured)
+                self.assertEqual(len(f.pool.free_slots), 16)
+                self.assertTrue(torch.all(f.pool.req_to_token == -77))
+
+    def test_tp_moe_fixed_buffer_replay_refreshes_ids_counts_and_padding(self):
+        """New requests must not reuse capture IDs or route stale/NaN CP padding.
+
+        FX records the CPU tensor operations once, retaining static input/count
+        addresses. Replays execute those operations without rerunning Python
+        transport or layer preparation, like CUDA graph replay.
+        """
+        from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
+            RowBucketGraphRunner,
+            _Graph,
+        )
+
+        for vl_routing in (False, True):
+            with (
+                self.subTest(vl_routing=vl_routing),
+                self._fixture(4, moe_backend=MoeA2ABackend.NONE, ep_size=4) as f,
+            ):
+                f.owner._model.late_layer_vl_routing = vl_routing
+                f.owner.runner = RowBucketGraphRunner(
+                    row_step=4, max_rows=8, label="CPU CP tail"
+                )
+                recordings, layer_calls, layouts = [], [], []
+
+                def gather(x):
+                    return torch.cat([x] * 4)
+
+                def layers(state, **kw):
+                    batch = kw["forward_batch"]
+                    count = batch.num_token_non_padded
+                    # Emulate an attention scratch buffer with dirty pad rows.
+                    # The transport must clear these on every recorded layer.
+                    x = state.streams[:, 0]
+                    x = torch.where(
+                        (torch.arange(x.shape[0]) < count)[:, None],
+                        x,
+                        torch.full_like(x, float("nan")),
+                    )
+                    transport = moe_transport.MoeRowTransport(
+                        None,
+                        x,
+                        batch,
+                        kw["input_ids"],
+                        kw["input_ids_global"],
+                        use_cp=True,
+                        cp_return_contiguous=True,
+                    )
+                    ids = transport.input_ids_global
+                    layouts.append(
+                        (
+                            transport.input.shape[0],
+                            None if ids is None else ids.shape[0],
+                        )
+                    )
+                    layer_calls.append(count.data_ptr())
+                    with transport.gathered_rows:
+                        self.assertIsNone(batch.moe_num_token_non_padded())
+                        # A cross-row reduction makes any poisoned padding visible.
+                        result = transport.input + transport.input.sum() / 100
+                        if vl_routing:
+                            result = result + ids[:, None]
+                    return transport.return_output(result), None, []
+
+                def record(body, rows, count, capture_batch, start, free_before):
+                    program = make_fx(body)()
+                    outputs = program()
+
+                    def replay():
+                        for output, current in zip(outputs, program()):
+                            if output is not None:
+                                output.copy_(current)
+
+                    recordings.append(rows)
+                    return _Graph(
+                        SimpleNamespace(replay=replay), count, outputs, (capture_batch,)
+                    )
+
+                parallel = SimpleNamespace(
+                    attn_cp_size=4,
+                    attn_cp_rank=0,
+                    tp_size=4,
+                    tp_group=SimpleNamespace(all_reduce=lambda x: x * 4),
+                )
+                with (
+                    mock.patch.object(f.owner, "_layer_stack", side_effect=layers),
+                    mock.patch.object(f.owner.runner, "_record", side_effect=record),
+                    mock.patch.object(
+                        deepseek_v4_replay_tail,
+                        "attn_cp_interleave_gather",
+                        side_effect=gather,
+                    ),
+                    mock.patch.object(
+                        moe_transport, "attn_cp_interleave_gather", side_effect=gather
+                    ),
+                    mock.patch.object(
+                        moe_transport, "get_parallel", return_value=parallel
+                    ),
+                    f.startup._startup_batch(f.runner, [128]) as batch,
+                ):
+                    original_count = batch.num_token_non_padded
+
+                    def run(rows, logical, offset):
+                        cp = InterleaveContextParallelMetadata(
+                            per_rank_actual_token=[rows] * 4,
+                            per_rank_logical_token=[logical, rows, rows, rows],
+                            local_index=torch.arange(rows),
+                            gather_index=torch.arange(rows * 4).flip(0),
+                        )
+                        batch.attn_cp_metadata = cp
+                        x = torch.arange(rows).float()[:, None, None] + offset
+                        ids = torch.arange(rows) + 10 * offset
+                        value, _, _ = f.owner.run(
+                            state=HcState(x),
+                            positions=torch.arange(rows),
+                            input_ids=ids,
+                            # These live global IDs deliberately have a different
+                            # row axis from the bucket and must not be copied as local.
+                            input_ids_global=torch.full((rows * 4,), -999),
+                            forward_batch=batch,
+                            capture_dspark=False,
+                        )
+                        expected = x[:logical, 0] + x[:logical].sum() * 4 / 100
+                        if vl_routing:
+                            expected = expected + ids[:logical, None]
+                        torch.testing.assert_close(value[:logical], expected * 4)
+                        self.assertTrue(f.owner._last_run_replayed)
+                        self.assertIs(batch.num_token_non_padded, original_count)
+                        self.assertIs(batch.attn_cp_metadata, cp)
+                        self.assertIsNone(cp.moe_local_token_count)
+
+                    for bcg in (False, True):
+                        with (
+                            prefill_graph_scope(full_graph=False)
+                            if bcg
+                            else contextlib.nullcontext()
+                        ):
+                            f.owner._startup_capture = True
+                            run(8, 8, 1)
+                            run(4, 4, 2)
+                            f.owner._startup_capture = False
+                            calls_before = len(layer_calls)
+                            # Shrink, grow, change logical count at the same physical
+                            # size, then use a different bucket and fresh metadata.
+                            for rows, logical, offset in (
+                                (3, 2, 3),
+                                (1, 1, 4),
+                                (4, 3, 5),
+                                (7, 5, 6),
+                            ):
+                                run(rows, logical, offset)
+                            self.assertEqual(len(layer_calls), calls_before)
+                    self.assertEqual(recordings, [8, 4, 8, 4])
+                    self.assertEqual(
+                        layouts,
+                        [
+                            (32, 32 if vl_routing else None),
+                            (16, 16 if vl_routing else None),
+                        ]
+                        * 2,
+                    )
+
+    def test_tail_capture_progress_is_visible_only_on_rank_zero(self):
+        """Startup reports completed row buckets, without one progress bar per rank."""
+        for rank in (0, 1):
+            with self.subTest(rank=rank), self._fixture(4) as f:
+                stream = io.StringIO()
+                real_tqdm = f.startup.tqdm.tqdm
+
+                def progress(values, **kwargs):
+                    return real_tqdm(values, file=stream, mininterval=0, **kwargs)
+
+                with (
+                    get_parallel().override(tp_rank=rank),
+                    mock.patch.object(f.startup.tqdm, "tqdm", side_effect=progress),
+                ):
+                    f.owner.capture_at_startup(f.runner, f.eager)
+                if rank == 0:
+                    self.assertIn("Capturing decoder tail shape", stream.getvalue())
+                    self.assertIn("num_tokens=128", stream.getvalue())
+                    self.assertIn("local_rows=32", stream.getvalue())
+                    self.assertIn("16/16", stream.getvalue())
+                else:
+                    self.assertEqual(stream.getvalue(), "")
+                self.assertEqual(len(f.records), 16)
+
     def test_startup_prepares_outer_bcg_state_variant(self):
         """A BCG prefix's different state layout must not miss at first replay."""
-        with self._fixture(4) as f:
+        for backend in (MoeA2ABackend.MEGAMOE, MoeA2ABackend.NONE):
+            with self.subTest(backend=backend):
+                self._check_outer_bcg_state_variant(backend)
+
+    def _check_outer_bcg_state_variant(self, backend):
+        with (
+            self._fixture(4, moe_backend=backend, ep_size=4) as f,
+            get_exec().graph.override(
+                enable_decoder_tail_cuda_graph=True,
+                cuda_graph_config=CudaGraphConfig(
+                    prefill=PhaseConfig(backend=Backend.BREAKABLE)
+                ),
+            ),
+        ):
+            self.assertEqual(get_parallel().tp_size, 4)
+            self.assertEqual(get_parallel().ep_size, 4)
+            self.assertEqual(get_parallel().attn_cp_size, 4)
+            self.assertEqual(get_parallel().attn_tp_size, 1)
             executions = []
 
             def execute(batch):
