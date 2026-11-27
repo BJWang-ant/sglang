@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -1342,6 +1342,24 @@ class DeepseekV4AttnBackend(
             return SharedReadEnds.POST_REPLAY
         return super().shared_read_ends(fm)
 
+    @contextmanager
+    def preserve_tail_graph_state(self):
+        saved = (
+            self.forward_metadata,
+            self.tail_forward_metadata,
+            self.prefill_graph_replay_batch,
+            self.tail_source_kv_layer_id,
+        )
+        try:
+            yield
+        finally:
+            (
+                self.forward_metadata,
+                self.tail_forward_metadata,
+                self.prefill_graph_replay_batch,
+                self.tail_source_kv_layer_id,
+            ) = saved
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2631,6 +2649,14 @@ class DeepseekV4AttnBackend(
             skip_low_ratio_indexer,
         )
 
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Clear prefill-only state before any early metadata return or capture.
+            self.tail_forward_metadata = None
+            self.tail_source_kv_layer_id = None
+
         # Replay prep built this in full except the indexer top-k plans, which the graph
         # records like the in-graph upgrade (the prep's copy diverged at long context).
         if id(self.forward_metadata) in self._early_verify_metadata_ids:
@@ -2643,14 +2669,10 @@ class DeepseekV4AttnBackend(
                 raw_metadata=self.forward_metadata,
                 online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
             )
-            # Decode/verify graphs have no late-layer tail; drop the one the
-            # prefill graph capture or replay before this batch left behind.
-            self.tail_forward_metadata = None
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )
-            self.tail_forward_metadata = None
 
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata):
@@ -2815,6 +2837,9 @@ class DeepseekV4AttnBackend(
         in_capture: bool = False,
     ) -> None:
         bucket = _GraphBucket.of(forward_batch.forward_mode)
+        if bucket in (_GraphBucket.DECODE_OR_IDLE, _GraphBucket.TARGET_VERIFY):
+            self.tail_forward_metadata = None
+            self.tail_source_kv_layer_id = None
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
